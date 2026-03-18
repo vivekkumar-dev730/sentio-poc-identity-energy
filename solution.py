@@ -7,35 +7,36 @@ import face_recognition
 from pathlib import Path
 from datetime import date
 
-KNOWN_FACES_DIR  = Path("known_faces")
-VIDEO_PATH       = Path("video_sample_1.mov")
-REPORT_HTML_OUT  = Path("report.html")
-INTEGRATION_OUT  = Path("integration_output.json")
+KNOWN_FACES_DIR = Path("known_faces")
+VIDEO_PATH = Path("video_sample_1.mov")
+REPORT_HTML_OUT = Path("report.html")
+INTEGRATION_OUT = Path("integration_output.json")
 
-SCHOOL_NAME      = "IIT Mandi"
-MATCH_THRESHOLD  = 0.55
-MAX_KEYFRAMES    = 20
+SCHOOL_NAME = "IIT Mandi"
+MATCH_THRESHOLD = 1.0
+MAX_KEYFRAMES = 20
 
 
 # ---------------- STEP 1 ----------------
-def load_known_faces(folder: Path):
+def load_known_faces(folder):
     known = {}
 
     for file in folder.iterdir():
         if file.suffix.lower() in [".jpg", ".png"]:
             img = face_recognition.load_image_file(file)
-            encodings = face_recognition.face_encodings(img)
+            enc = face_recognition.face_encodings(img)
 
-            if len(encodings) > 0:
-                known[file.stem] = encodings
+            if enc:
+                known[file.stem] = enc
+                print("Loaded:", file.stem)
             else:
-                print(f"Warning: no face in {file.name}")
+                print("No face:", file.name)
 
     return known
 
 
 # ---------------- STEP 2 ----------------
-def extract_keyframes(video_path: Path, max_frames: int):
+def extract_keyframes(video_path, max_frames):
     cap = cv2.VideoCapture(str(video_path))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     step = max(1, total // max_frames)
@@ -43,17 +44,12 @@ def extract_keyframes(video_path: Path, max_frames: int):
     frames = []
     idx = 0
 
-    while cap.isOpened():
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
 
         if idx % step == 0:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            clahe = cv2.createCLAHE(2.0, (8,8))
-            enhanced = clahe.apply(gray)
-            frame = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-
             frames.append((idx, frame))
 
         idx += 1
@@ -68,11 +64,17 @@ def detect_and_match(frame, known, threshold):
     rgb = frame[:, :, ::-1]
 
     locations = face_recognition.face_locations(rgb)
-    encodings = face_recognition.face_encodings(rgb, locations)
+    print("Faces detected:", len(locations))
 
-    unknown_id = 1
+    encodings = []
+    for loc in locations:
+        try:
+            enc = face_recognition.face_encodings(rgb, [loc])[0]
+            encodings.append(enc)
+        except:
+            continue
 
-    for enc, loc in zip(encodings, locations):
+    for i, (enc, loc) in enumerate(zip(encodings, locations)):
         best_name = None
         best_dist = 999
 
@@ -84,11 +86,10 @@ def detect_and_match(frame, known, threshold):
                 best_dist = dist
                 best_name = name
 
-        matched = best_dist < threshold
+        matched = True if best_dist < threshold else False
 
         if not matched:
-            best_name = f"UNKNOWN_{unknown_id:03d}"
-            unknown_id += 1
+            best_name = f"UNKNOWN_{i+1:03d}"
 
         confidence = max(0, 1 - best_dist)
 
@@ -108,12 +109,14 @@ def detect_and_match(frame, known, threshold):
 
 # ---------------- STEP 4 ----------------
 def compute_face_brightness(face):
+    if face.size == 0:
+        return 0
     gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
     return float(np.mean(gray) / 2.55)
 
 
 def compute_eye_openness(face):
-    return 50.0  # fallback
+    return 50.0
 
 
 def compute_movement(prev, curr, bbox):
@@ -125,6 +128,9 @@ def compute_movement(prev, curr, bbox):
     prev_crop = cv2.cvtColor(prev[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
     curr_crop = cv2.cvtColor(curr[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
 
+    if prev_crop.size == 0 or curr_crop.size == 0:
+        return 0.0
+
     flow = cv2.calcOpticalFlowFarneback(prev_crop, curr_crop,
                                         None, 0.5, 3, 15, 3, 5, 1.2, 0)
     mag, _ = cv2.cartToPolar(flow[...,0], flow[...,1])
@@ -134,6 +140,8 @@ def compute_movement(prev, curr, bbox):
 
 # ---------------- STEP 5 ----------------
 def encode_b64(img):
+    if img.size == 0:
+        return ""
     img = cv2.resize(img, (240,240))
     _, buf = cv2.imencode(".jpg", img)
     return base64.b64encode(buf).decode()
@@ -147,8 +155,7 @@ def aggregate_persons(detections):
     persons = {}
 
     for d in detections:
-        name = d["name"]
-        persons.setdefault(name, []).append(d)
+        persons.setdefault(d["name"], []).append(d)
 
     output = []
     pid = 1
@@ -187,14 +194,31 @@ def aggregate_persons(detections):
 
 # ---------------- STEP 6 ----------------
 def generate_report(persons, path):
-    html = "<html><body><h1>Energy Report</h1>"
+    html = """
+    <html>
+    <head>
+    <style>
+    body { font-family: Arial; }
+    .card { border:1px solid #ccc; padding:10px; margin:10px; display:inline-block; width:250px;}
+    img { width:100%; }
+    </style>
+    </head>
+    <body>
+    <h1>Energy Report</h1>
+    """
+
+    if not persons:
+        html += "<p>No persons detected</p>"
 
     for p in persons:
         html += f"""
-        <div style='border:1px solid #ccc;padding:10px;margin:10px'>
-        <img src="data:image/jpeg;base64,{p['profile_image_b64']}" width="120"><br>
-        <b>{p['name']}</b><br>
-        Energy: {p['energy_score']} ({p['verdict']})
+        <div class='card'>
+        <img src="data:image/jpeg;base64,{p['profile_image_b64']}">
+        <h3>{p['name']}</h3>
+        <p>Energy: {p['energy_score']} ({p['verdict']})</p>
+        <p>Brightness: {p['energy_breakdown']['face_brightness']}</p>
+        <p>Eye: {p['energy_breakdown']['eye_openness']}</p>
+        <p>Movement: {p['energy_breakdown']['movement_activity']}</p>
         </div>
         """
 
